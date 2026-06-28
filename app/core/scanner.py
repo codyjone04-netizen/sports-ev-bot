@@ -86,7 +86,10 @@ class MarketScanner:
             from app.scrapers.sports import OddsAPIScraper
             scraper = OddsAPIScraper(settings.odds_api_key)
             all_results: list[tuple[dict, str, MarketContext]] = []
-            sports = [
+            active_sports = await scraper.fetch_active_sports()
+            # Pick up to 4 active sports
+            available = [(s, "h2h,totals") for s in active_sports[:4]]
+            sports = available or [
                 ("soccer_fifa_world_cup", "h2h,totals,btts"),
                 ("soccer_epl", "h2h,totals,btts"),
                 ("basketball_nba", "h2h,totals"),
