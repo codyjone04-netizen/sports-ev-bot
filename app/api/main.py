@@ -332,12 +332,18 @@ async def markets_list(
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
-@app.post("/api/scan", response_model=ScanResponse)
+@app.post("/api/scan")
 async def trigger_scan(background_tasks: BackgroundTasks):
     """Manually trigger an immediate market scan."""
     scanner = get_scanner()
     result = await scanner.scan_once()
-    return ScanResponse(**result)
+    return {
+        "markets": result.get("markets", 0),
+        "predictions": result.get("predictions", 0),
+        "high_ev_picks": result.get("high_ev_picks", 0),
+        "alerts": result.get("alerts", 0),
+        "elapsed_s": result.get("elapsed_s", 0.0),
+    }
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
