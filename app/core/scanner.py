@@ -86,20 +86,26 @@ class MarketScanner:
             from app.scrapers.sports import OddsAPIScraper
             scraper = OddsAPIScraper(settings.odds_api_key)
             all_results: list[tuple[dict, str, MarketContext]] = []
-            active_sports = await scraper.fetch_active_sports()
-            # Pick up to 4 active sports
-            available = [(s, "h2h,totals") for s in active_sports[:4]]
-            sports = available or [
-                ("soccer_fifa_world_cup", "h2h,totals,btts"),
-                ("soccer_epl", "h2h,totals,btts"),
-                ("basketball_nba", "h2h,totals"),
+            # Explicit sport configs — h2h,totals works for all, btts only some
+            sport_configs = [
+                ("soccer_fifa_world_cup", "h2h,totals"),
+                ("soccer_epl", "h2h,totals"),
+                ("soccer_brazil_campeonato", "h2h,totals"),
+                ("soccer_conmebol_copa_libertadores", "h2h,totals"),
+                ("baseball_mlb", "h2h,totals"),
+                ("basketball_wnba", "h2h,totals"),
                 ("americanfootball_nfl", "h2h,spreads,totals"),
+                ("americanfootball_nfl_preseason", "h2h,spreads,totals"),
+                ("tennis_atp_wimbledon", "h2h"),
+                ("tennis_wta_wimbledon", "h2h"),
+                ("mma_mixed_martial_arts", "h2h"),
+                ("cricket_international_t20", "h2h,totals"),
             ]
-            for sport_key, markets in sports:
+            for sport_key, markets in sport_configs:
                 events = await scraper.fetch_odds(sport=sport_key, markets=markets)
                 parsed = scraper.parse_events_to_contexts(events, sport_key=sport_key)
                 all_results.extend(parsed)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
             return all_results
         except Exception as exc:
             logger.error("sports_odds_collect_failed", error=str(exc))
