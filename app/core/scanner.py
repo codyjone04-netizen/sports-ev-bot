@@ -44,6 +44,8 @@ def _sport_enum(sp: str) -> Sport:
 
 
 def _decimal_to_american(dec: float) -> int:
+    if dec <= 1.0:
+        return -10000
     if dec >= 2.0:
         return int(round((dec - 1) * 100))
     else:
