@@ -88,7 +88,6 @@ class MarketScanner:
             from app.scrapers.sports import OddsAPIScraper
             scraper = OddsAPIScraper(settings.odds_api_key)
             all_results: list[tuple[dict, str, MarketContext]] = []
-            # Explicit sport configs — h2h,totals works for all, btts only some
             sport_configs = [
                 ("soccer_fifa_world_cup", "h2h,totals"),
                 ("soccer_epl", "h2h,totals"),
@@ -125,34 +124,34 @@ class MarketScanner:
                 return None
         return None
 
-async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketContext, source: str) -> Market:
-    event_date = self._parse_date(raw.get("event_date") or raw.get("close_time"))
-    external_id = str(raw.get("ticker") or raw.get("event_id") or raw.get("slug") or "")[:256]
-    market = Market(
-        id=uuid.uuid4(),
-        external_id=external_id or str(uuid.uuid4()),
-        source=source,
-        sport=_sport_enum(ctx.sport),
-        market_type=_market_type_enum(ctx.market_type),
-        event_name=str(raw.get("event_name") or raw.get("title") or raw.get("question") or "")[:512],
-        event_date=event_date,
-        home_team=str(raw.get("home_team") or ctx.home_team or "")[:256],
-        away_team=str(raw.get("away_team") or ctx.away_team or "")[:256],
-        player_name=str(raw.get("player_name") or ctx.player_name or "")[:256],
-        selection=str(raw.get("selection") or raw.get("outcome") or "YES")[:512],
-        line=ctx.line,
-        decimal_odds=ctx.decimal_odds,
-        american_odds=_decimal_to_american(ctx.decimal_odds),
-        implied_probability=ctx.implied_probability,
-        volume=ctx.volume,
-        opening_odds=ctx.opening_decimal_odds,
-        line_movement=ctx.line_movement,
-        extra_data=ctx.extra,
-        scraped_at=datetime.now(timezone.utc),
-    )
-    session.add(market)
-    return market
-    
+    async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketContext, source: str) -> Market:
+        event_date = self._parse_date(raw.get("event_date") or raw.get("close_time"))
+        external_id = str(raw.get("ticker") or raw.get("event_id") or raw.get("slug") or "")
+        market = Market(
+            id=uuid.uuid4(),
+            external_id=(external_id or str(uuid.uuid4()))[:256],
+            source=source,
+            sport=_sport_enum(ctx.sport),
+            market_type=_market_type_enum(ctx.market_type),
+            event_name=str(raw.get("event_name") or raw.get("title") or raw.get("question") or "")[:512],
+            event_date=event_date,
+            home_team=str(raw.get("home_team") or ctx.home_team or "")[:256],
+            away_team=str(raw.get("away_team") or ctx.away_team or "")[:256],
+            player_name=str(raw.get("player_name") or ctx.player_name or "")[:256],
+            selection=str(raw.get("selection") or raw.get("outcome") or "YES")[:512],
+            line=ctx.line,
+            decimal_odds=ctx.decimal_odds,
+            american_odds=_decimal_to_american(ctx.decimal_odds),
+            implied_probability=ctx.implied_probability,
+            volume=ctx.volume,
+            opening_odds=ctx.opening_decimal_odds,
+            line_movement=ctx.line_movement,
+            extra_data=ctx.extra,
+            scraped_at=datetime.now(timezone.utc),
+        )
+        session.add(market)
+        return market
+
     async def _persist_prediction(self, session: AsyncSession, market: Market, pred: dict, explanation: str) -> Prediction:
         ev = pred["expected_value"]
         conf = pred["confidence"]
@@ -160,8 +159,8 @@ async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketCon
         prediction = Prediction(
             id=uuid.uuid4(),
             market_id=market.id,
-            model_name="ensemble",
-            model_version="latest",
+            model_name="statistical",
+            model_version="v1",
             model_probability=pred["model_probability"],
             confidence=conf,
             expected_value=ev,
@@ -218,7 +217,6 @@ async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketCon
         logger.info("scan_started")
         t0 = asyncio.get_event_loop().time()
 
-        # Collect from all sources
         results = await asyncio.gather(
             self._collect_kalshi(),
             self._collect_polymarket(),
@@ -243,7 +241,6 @@ async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketCon
         if not contexts:
             return {"markets": 0, "predictions": 0, "high_ev_picks": 0, "alerts": 0, "elapsed_s": 0.0}
 
-        # Batch predict
         ctx_list = [c for _, _, c in contexts]
         preds = self._predictor.batch_predict(ctx_list)
 
@@ -330,7 +327,7 @@ async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketCon
         logger.info("scan_complete", **summary)
         return summary
 
- async def run_forever(self) -> None:
+    async def run_forever(self) -> None:
         self._running = True
         logger.info("scanner_started", interval_s=settings.scan_interval_seconds)
         while self._running:
