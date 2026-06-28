@@ -111,7 +111,20 @@ class MarketScanner:
             logger.error("sports_odds_collect_failed", error=str(exc))
             return []
 
+    def _parse_date(self, val):
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            return val
+        if isinstance(val, str):
+            try:
+                return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return None
+
     async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketContext, source: str) -> Market:
+        event_date = self._parse_date(raw.get("event_date") or raw.get("close_time"))
         market = Market(
             id=uuid.uuid4(),
             external_id=str(raw.get("ticker") or raw.get("event_id") or raw.get("slug") or "")[:256],
@@ -119,7 +132,7 @@ class MarketScanner:
             sport=_sport_enum(ctx.sport),
             market_type=_market_type_enum(ctx.market_type),
             event_name=str(raw.get("event_name") or raw.get("title") or raw.get("question") or "")[:512],
-            event_date=raw.get("event_date") or raw.get("close_time"),
+            event_date=event_date,
             home_team=str(raw.get("home_team") or ctx.home_team or "")[:256],
             away_team=str(raw.get("away_team") or ctx.away_team or "")[:256],
             player_name=str(raw.get("player_name") or ctx.player_name or "")[:256],
