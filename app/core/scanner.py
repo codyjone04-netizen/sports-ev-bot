@@ -330,7 +330,7 @@ async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketCon
         logger.info("scan_complete", **summary)
         return summary
 
-    async def run_forever(self) -> None:
+ async def run_forever(self) -> None:
         self._running = True
         logger.info("scanner_started", interval_s=settings.scan_interval_seconds)
         while self._running:
