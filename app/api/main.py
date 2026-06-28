@@ -3,22 +3,22 @@ app/api/main.py — FastAPI application.
 
 Endpoints
 ---------
-GET  /health                  — liveness probe
-GET  /api/picks/today         — top picks for today
-GET  /api/parlays/today       — best parlays for today
-GET  /api/predictions         — paginated prediction history
-GET  /api/stats/roi           — historical ROI / win-rate summary
-GET  /api/stats/model         — model accuracy and calibration
-GET  /api/markets             — raw market snapshots
-POST /api/predictions/{id}/result — record actual outcome
-POST /api/scan                — trigger an immediate scan (admin)
-GET  /dashboard               — web dashboard (HTML)
+GET  /health                        — liveness probe
+GET  /api/picks/today               — top EV picks sorted by EV descending
+GET  /api/parlays/today             — best parlays sorted by combined EV
+GET  /api/predictions               — paginated prediction history
+GET  /api/stats/roi                 — historical ROI / win-rate summary
+GET  /api/stats/model               — model info (ML or statistical)
+GET  /api/markets                   — raw market snapshots
+POST /api/predictions/{id}/result   — record actual outcome
+POST /api/scan                      — trigger an immediate scan (admin)
+GET  /dashboard                     — web dashboard (HTML)
 """
 from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
@@ -43,7 +43,6 @@ configure_logging()
 logger = get_logger(__name__)
 settings = get_settings()
 
-# ── Scanner singleton (shared with background task) ───────────────────────────
 from app.core.scanner import MarketScanner  # noqa: E402
 _scanner: MarketScanner | None = None
 
@@ -54,8 +53,6 @@ def get_scanner() -> MarketScanner:
         _scanner = MarketScanner()
     return _scanner
 
-
-# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Sports EV Bot API",
@@ -75,7 +72,6 @@ app.add_middleware(
 async def startup() -> None:
     await init_db()
     scanner = get_scanner()
-    # Start background scanning loop
     asyncio.create_task(scanner.run_forever())
     logger.info("app_started")
 
@@ -104,58 +100,104 @@ async def health() -> dict:
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
-# ── Picks / Predictions ───────────────────────────────────────────────────────
+# ── Picks ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/picks/today")
 async def picks_today(
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=100),
     min_ev: float = Query(0.0),
     min_conf: float = Query(0.0),
+    sport: Optional[str] = None,
+    market_type: Optional[str] = None,
 ):
-    """Top predictions from the last 24h sorted by EV descending."""
+    """
+    Top predictions sorted by EV descending.
+    Returns picks from the last 2 hours (most recent scan window).
+    Falls back to last 24h if recent window is empty.
+    """
     async with get_db() as session:
-        stmt = (
-            select(Prediction, Market)
-            .join(Market, Prediction.market_id == Market.id)
-            .where(Prediction.expected_value >= min_ev)
-            .where(Prediction.confidence >= min_conf)
-            .order_by(Prediction.expected_value.desc())
-            .limit(limit)
-        )
-        rows = (await session.execute(stmt)).all()
-        return [
-            {
-                "prediction_id": str(pred.id),
-                "event": market.event_name,
-                "selection": market.selection,
-                "market_type": market.market_type.value if market.market_type else "",
-                "sport": market.sport.value if market.sport else "",
-                "source": market.source,
-                "decimal_odds": market.decimal_odds,
-                "american_odds": market.american_odds,
-                "implied_prob": market.implied_probability,
-                "model_prob": round(pred.model_probability, 4),
-                "confidence": round(pred.confidence, 4),
-                "expected_value": round(pred.expected_value, 4),
-                "kelly_fraction": round(pred.kelly_fraction or 0, 4),
-                "risk_level": pred.risk_level.value if pred.risk_level else "",
-                "explanation": pred.explanation,
-                "created_at": pred.created_at.isoformat() if pred.created_at else None,
-            }
-            for pred, market in rows
-        ]
+        def build_stmt(since: datetime):
+            s = (
+                select(Prediction, Market)
+                .join(Market, Prediction.market_id == Market.id)
+                .where(Prediction.expected_value >= min_ev)
+                .where(Prediction.confidence >= min_conf)
+                .where(Prediction.created_at >= since)
+                .order_by(Prediction.expected_value.desc())
+                .limit(limit)
+            )
+            if sport:
+                s = s.where(Market.sport == sport)
+            if market_type:
+                s = s.where(Market.market_type == market_type)
+            return s
 
+        now = datetime.now(timezone.utc)
+        # Try last 2 hours first (current scan)
+        rows = (await session.execute(build_stmt(now - timedelta(hours=2)))).all()
+        window = "2h"
+        # Fall back to last 24h
+        if not rows:
+            rows = (await session.execute(build_stmt(now - timedelta(hours=24)))).all()
+            window = "24h"
+
+        return {
+            "window": window,
+            "count": len(rows),
+            "picks": [
+                {
+                    "prediction_id": str(pred.id),
+                    "event": market.event_name,
+                    "selection": market.selection,
+                    "market_type": market.market_type.value if market.market_type else "",
+                    "sport": market.sport.value if market.sport else "",
+                    "source": market.source,
+                    "decimal_odds": market.decimal_odds,
+                    "american_odds": market.american_odds,
+                    "implied_prob": round(market.implied_probability, 4),
+                    "model_prob": round(pred.model_probability, 4),
+                    "confidence": round(pred.confidence, 4),
+                    "expected_value": round(pred.expected_value, 4),
+                    "ev_pct": f"{pred.expected_value * 100:+.1f}%",
+                    "kelly_fraction": round(pred.kelly_fraction or 0, 4),
+                    "kelly_pct": f"{(pred.kelly_fraction or 0) * 100:.1f}%",
+                    "risk_level": pred.risk_level.value if pred.risk_level else "",
+                    "explanation": pred.explanation,
+                    "event_date": market.event_date.isoformat() if market.event_date else None,
+                    "created_at": pred.created_at.isoformat() if pred.created_at else None,
+                }
+                for pred, market in rows
+            ],
+        }
+
+
+# ── Parlays ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/parlays/today")
-async def parlays_today(limit: int = Query(10, ge=1, le=50)):
-    """Best parlays from today sorted by combined EV."""
+async def parlays_today(
+    limit: int = Query(12, ge=1, le=50),
+    min_legs: int = Query(2, ge=2, le=5),
+    max_legs: int = Query(5, ge=2, le=5),
+):
+    """Best parlays sorted by combined EV, most recent scan first."""
     async with get_db() as session:
-        stmt = (
-            select(Parlay)
-            .order_by(Parlay.combined_ev.desc())
-            .limit(limit)
-        )
-        parlays = (await session.execute(stmt)).scalars().all()
+        now = datetime.now(timezone.utc)
+
+        # Try last 2h, fall back to 24h
+        for hours in [2, 24]:
+            since = now - timedelta(hours=hours)
+            stmt = (
+                select(Parlay)
+                .where(Parlay.created_at >= since)
+                .where(Parlay.num_legs >= min_legs)
+                .where(Parlay.num_legs <= max_legs)
+                .order_by(Parlay.combined_ev.desc())
+                .limit(limit)
+            )
+            parlays = (await session.execute(stmt)).scalars().all()
+            if parlays:
+                break
+
         results = []
         for p in parlays:
             legs_stmt = (
@@ -171,22 +213,31 @@ async def parlays_today(limit: int = Query(10, ge=1, le=50)):
                 "num_legs": p.num_legs,
                 "combined_odds": round(p.combined_odds, 2),
                 "combined_ev": round(p.combined_ev, 4),
+                "combined_ev_pct": f"{p.combined_ev * 100:+.1f}%",
                 "combined_confidence": round(p.combined_confidence, 4),
                 "risk_level": p.risk_level.value if p.risk_level else "",
+                "correlation_score": round(p.correlation_score or 0, 3),
                 "created_at": p.created_at.isoformat() if p.created_at else None,
                 "legs": [
                     {
                         "event": market.event_name,
                         "selection": market.selection,
-                        "decimal_odds": market.decimal_odds,
+                        "market_type": market.market_type.value if market.market_type else "",
+                        "sport": market.sport.value if market.sport else "",
+                        "decimal_odds": round(market.decimal_odds, 2),
+                        "american_odds": market.american_odds,
                         "ev": round(pred.expected_value, 4),
+                        "ev_pct": f"{pred.expected_value * 100:+.1f}%",
                         "confidence": round(pred.confidence, 4),
+                        "event_date": market.event_date.isoformat() if market.event_date else None,
                     }
                     for pred, market in leg_rows
                 ],
             })
-        return results
+        return {"count": len(results), "parlays": results}
 
+
+# ── Predictions (paginated history) ──────────────────────────────────────────
 
 @app.get("/api/predictions")
 async def predictions_list(
@@ -227,6 +278,8 @@ async def predictions_list(
         ]
 
 
+# ── Result recording ──────────────────────────────────────────────────────────
+
 @app.post("/api/predictions/{prediction_id}/result")
 async def record_result(prediction_id: str, body: RecordResultRequest):
     """Record the actual outcome of a prediction for model retraining."""
@@ -234,7 +287,6 @@ async def record_result(prediction_id: str, body: RecordResultRequest):
         pid = uuid.UUID(prediction_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid prediction_id")
-
     try:
         outcome = ResultOutcome(body.outcome)
     except ValueError:
@@ -244,7 +296,6 @@ async def record_result(prediction_id: str, body: RecordResultRequest):
         pred = await session.get(Prediction, pid)
         if not pred:
             raise HTTPException(status_code=404, detail="Prediction not found")
-
         result = PredictionResult(
             id=uuid.uuid4(),
             prediction_id=pid,
@@ -263,7 +314,6 @@ async def record_result(prediction_id: str, body: RecordResultRequest):
 
 @app.get("/api/stats/roi")
 async def stats_roi():
-    """Aggregate ROI and win rate across all resolved predictions."""
     async with get_db() as session:
         stmt = select(PredictionResult)
         results = (await session.execute(stmt)).scalars().all()
@@ -285,14 +335,34 @@ async def stats_roi():
 
 @app.get("/api/stats/model")
 async def stats_model():
-    """Latest model run statistics."""
+    """Model info — shows whether using ML or statistical predictor."""
     from app.core.models import ModelRun
+    from app.ml.pipeline import load_model
+    using_ml = load_model() is not None
     async with get_db() as session:
-        stmt = select(ModelRun).where(ModelRun.is_active == True).order_by(ModelRun.trained_at.desc()).limit(1)
+        stmt = (
+            select(ModelRun)
+            .where(ModelRun.is_active == True)
+            .order_by(ModelRun.trained_at.desc())
+            .limit(1)
+        )
         run = (await session.execute(stmt)).scalar_one_or_none()
-        if not run:
-            return {"message": "No model runs recorded yet"}
-        return {
+
+        # Count total predictions in DB
+        total_preds = (await session.execute(select(func.count()).select_from(Prediction))).scalar()
+        total_markets = (await session.execute(select(func.count()).select_from(Market))).scalar()
+
+    base = {
+        "predictor_mode": "ml_ensemble" if using_ml else "statistical",
+        "total_predictions": total_preds,
+        "total_markets_scanned": total_markets,
+        "thresholds": {
+            "min_ev": settings.min_ev_threshold,
+            "min_confidence": settings.confidence_threshold,
+        },
+    }
+    if run:
+        base.update({
             "model": run.model_name,
             "version": run.version,
             "train_samples": run.train_samples,
@@ -301,8 +371,11 @@ async def stats_model():
             "brier_score": run.brier_score,
             "roc_auc": run.roc_auc,
             "trained_at": run.trained_at.isoformat() if run.trained_at else None,
-        }
+        })
+    return base
 
+
+# ── Markets ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/markets")
 async def markets_list(
@@ -333,8 +406,8 @@ async def markets_list(
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/scan")
-async def trigger_scan(background_tasks: BackgroundTasks):
-    """Manually trigger an immediate market scan."""
+async def trigger_scan():
+    """Manually trigger an immediate market scan and return results."""
     scanner = get_scanner()
     result = await scanner.scan_once()
     return {
@@ -350,6 +423,5 @@ async def trigger_scan(background_tasks: BackgroundTasks):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    """Serve the web dashboard."""
     from app.dashboard.html import render_dashboard
     return HTMLResponse(content=render_dashboard())

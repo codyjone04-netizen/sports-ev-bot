@@ -39,9 +39,16 @@ class Settings(BaseSettings):
     # ── Weather ───────────────────────────────────────────────────────────────
     openweather_key: Optional[str] = None
 
-    # ── EV / Betting ──────────────────────────────────────────────────────────
-    confidence_threshold: float = 0.85
-    min_ev_threshold: float = 0.05
+    # ── EV / Betting thresholds ───────────────────────────────────────────────
+    # confidence_threshold: minimum model confidence to generate an alert.
+    # Statistical predictor outputs probabilities ~0.52–0.70 on good spots,
+    # so 0.55 catches real edges without flooding with noise.
+    confidence_threshold: float = 0.55
+
+    # min_ev_threshold: minimum expected value (as a fraction) to surface a pick.
+    # 0.03 = +3% EV — meaningful edge but not so strict that nothing passes.
+    min_ev_threshold: float = 0.03
+
     alert_stake: float = 100.0
     max_kelly_fraction: float = 0.25
     scan_interval_seconds: int = 300
