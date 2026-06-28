@@ -1,13 +1,5 @@
 """
 app/core/scanner.py — Market scanning orchestration.
-
-Every SCAN_INTERVAL_SECONDS:
-1. Scrape all configured sources.
-2. Convert to MarketContext objects.
-3. Score with EVPredictor.
-4. Persist Markets + Predictions to DB.
-5. Build parlays.
-6. Fire Discord alerts for high-EV picks.
 """
 from __future__ import annotations
 
@@ -51,20 +43,21 @@ def _sport_enum(sp: str) -> Sport:
         return Sport.OTHER
 
 
-class MarketScanner:
-    """
-    Orchestrates the full scrape → score → persist → alert pipeline.
-    """
+def _decimal_to_american(dec: float) -> int:
+    if dec >= 2.0:
+        return int(round((dec - 1) * 100))
+    else:
+        return int(round(-100 / (dec - 1)))
 
+
+class MarketScanner:
     def __init__(self) -> None:
         self._predictor = EVPredictor()
-        self._discord_alert: "DiscordAlerter | None" = None  # injected lazily
+        self._discord_alert = None
         self._running = False
 
     def set_discord_alerter(self, alerter: object) -> None:
-        self._discord_alert = alerter  # type: ignore[assignment]
-
-    # ── Data collection ───────────────────────────────────────────────────────
+        self._discord_alert = alerter
 
     async def _collect_kalshi(self) -> list[tuple[dict, MarketContext]]:
         try:
@@ -95,7 +88,7 @@ class MarketScanner:
             all_results: list[tuple[dict, str, MarketContext]] = []
             sports = [
                 ("soccer_fifa_world_cup", "h2h,totals,btts"),
-                ("soccer_epl", "h2h,totals,btts,team_totals"),
+                ("soccer_epl", "h2h,totals,btts"),
                 ("basketball_nba", "h2h,totals"),
                 ("americanfootball_nfl", "h2h,spreads,totals"),
             ]
@@ -109,27 +102,19 @@ class MarketScanner:
             logger.error("sports_odds_collect_failed", error=str(exc))
             return []
 
-    # ── Persistence ───────────────────────────────────────────────────────────
-
-    async def _persist_market(
-        self,
-        session: AsyncSession,
-        raw: dict,
-        ctx: MarketContext,
-        source: str,
-    ) -> Market:
+    async def _persist_market(self, session: AsyncSession, raw: dict, ctx: MarketContext, source: str) -> Market:
         market = Market(
             id=uuid.uuid4(),
-            external_id=raw.get("ticker") or raw.get("event_id") or raw.get("slug") or "",
+            external_id=str(raw.get("ticker") or raw.get("event_id") or raw.get("slug") or "")[:256],
             source=source,
             sport=_sport_enum(ctx.sport),
             market_type=_market_type_enum(ctx.market_type),
-            event_name=raw.get("event_name") or raw.get("title") or raw.get("question") or "",
+            event_name=str(raw.get("event_name") or raw.get("title") or raw.get("question") or "")[:512],
             event_date=raw.get("event_date") or raw.get("close_time"),
-            home_team=raw.get("home_team") or ctx.home_team,
-            away_team=raw.get("away_team") or ctx.away_team,
-            player_name=raw.get("player_name") or ctx.player_name,
-            selection=raw.get("selection") or raw.get("outcome") or "YES",
+            home_team=str(raw.get("home_team") or ctx.home_team or "")[:256],
+            away_team=str(raw.get("away_team") or ctx.away_team or "")[:256],
+            player_name=str(raw.get("player_name") or ctx.player_name or "")[:256],
+            selection=str(raw.get("selection") or raw.get("outcome") or "YES")[:512],
             line=ctx.line,
             decimal_odds=ctx.decimal_odds,
             american_odds=_decimal_to_american(ctx.decimal_odds),
@@ -143,17 +128,10 @@ class MarketScanner:
         session.add(market)
         return market
 
-    async def _persist_prediction(
-        self,
-        session: AsyncSession,
-        market: Market,
-        pred: dict,
-        explanation: str,
-    ) -> Prediction:
+    async def _persist_prediction(self, session: AsyncSession, market: Market, pred: dict, explanation: str) -> Prediction:
         ev = pred["expected_value"]
         conf = pred["confidence"]
         risk = _risk_level(ev, conf)
-
         prediction = Prediction(
             id=uuid.uuid4(),
             market_id=market.id,
@@ -170,12 +148,7 @@ class MarketScanner:
         session.add(prediction)
         return prediction
 
-    async def _persist_parlay(
-        self,
-        session: AsyncSession,
-        parlay: ParlayResult,
-        prediction_map: dict[str, Prediction],
-    ) -> None:
+    async def _persist_parlay(self, session: AsyncSession, parlay: ParlayResult, prediction_map: dict) -> None:
         db_parlay = Parlay(
             id=uuid.uuid4(),
             num_legs=len(parlay.legs),
@@ -188,7 +161,6 @@ class MarketScanner:
         )
         session.add(db_parlay)
         await session.flush()
-
         for i, leg in enumerate(parlay.legs):
             pred = prediction_map.get(leg.prediction_id)
             if not pred:
@@ -200,73 +172,59 @@ class MarketScanner:
                 leg_order=i,
             ))
 
-    # ── Alert helpers ─────────────────────────────────────────────────────────
-
     def _make_explanation(self, ctx: MarketContext, pred: dict) -> str:
-        lines = []
         ev = pred["expected_value"]
         prob = pred["model_probability"]
         ip = ctx.implied_probability
         edge = prob - ip
-
-        lines.append(f"Model prob: {prob:.1%} vs implied {ip:.1%} (edge: {edge:+.1%})")
-        lines.append(f"EV: {ev:+.1%} | Kelly: {pred['kelly_fraction']:.1%}")
-
+        parts = [
+            f"Model prob: {prob:.1%} vs implied {ip:.1%} (edge: {edge:+.1%})",
+            f"EV: {ev:+.1%} | Kelly: {pred['kelly_fraction']:.1%}",
+        ]
         if ctx.market_type == "btts":
-            lines.append(f"H2H BTTS rate: {ctx.h2h_btts_rate:.0%}")
-            lines.append(f"Total goals exp: {ctx.home_goals_scored_avg + ctx.away_goals_scored_avg:.1f}/game")
-        elif ctx.market_type in ("player_shots", "player_passes", "player_tackles"):
-            lines.append(f"Player avg: {ctx.player_stat_avg:.1f} ± {ctx.player_stat_std:.1f}")
-        elif ctx.market_type == "moneyline":
-            lines.append(f"Home form: {ctx.home_form_points:.1f} pts/game | Away: {ctx.away_form_points:.1f}")
-
+            parts.append(f"H2H BTTS rate: {ctx.h2h_btts_rate:.0%}")
+        elif ctx.market_type in ("player_shots", "player_passes"):
+            parts.append(f"Player avg: {ctx.player_stat_avg:.1f}")
         if ctx.line_movement and abs(ctx.line_movement) > 0.1:
-            direction = "shortened" if ctx.line_movement < 0 else "drifted"
-            lines.append(f"Odds have {direction} from opening (movement: {ctx.line_movement:+.2f})")
-
-        return " | ".join(lines)
-
-    # ── Main scan cycle ───────────────────────────────────────────────────────
+            parts.append(f"Line moved: {ctx.line_movement:+.2f}")
+        return " | ".join(parts)
 
     async def scan_once(self) -> dict:
-        """Run one full scan cycle. Returns summary stats."""
         logger.info("scan_started")
         t0 = asyncio.get_event_loop().time()
 
-        # Collect from all sources concurrently
-        kalshi_data, poly_data, sports_data = await asyncio.gather(
+        # Collect from all sources
+        results = await asyncio.gather(
             self._collect_kalshi(),
             self._collect_polymarket(),
             self._collect_sports_odds(),
             return_exceptions=True,
         )
 
-        contexts: list[tuple[str, dict, MarketContext]] = []  # (source, raw, ctx)
+        kalshi_data = results[0] if not isinstance(results[0], Exception) else []
+        poly_data = results[1] if not isinstance(results[1], Exception) else []
+        sports_data = results[2] if not isinstance(results[2], Exception) else []
 
-        if not isinstance(kalshi_data, Exception):
-            for raw, ctx in kalshi_data:
-                contexts.append(("kalshi", raw, ctx))
-
-        if not isinstance(poly_data, Exception):
-            for raw, ctx in poly_data:
-                contexts.append(("polymarket", raw, ctx))
-
-        if not isinstance(sports_data, Exception):
-            for raw, _eid, ctx in sports_data:
-                contexts.append(("odds_api", raw, ctx))
+        contexts: list[tuple[str, dict, MarketContext]] = []
+        for raw, ctx in kalshi_data:
+            contexts.append(("kalshi", raw, ctx))
+        for raw, ctx in poly_data:
+            contexts.append(("polymarket", raw, ctx))
+        for raw, _eid, ctx in sports_data:
+            contexts.append(("odds_api", raw, ctx))
 
         logger.info("markets_collected", total=len(contexts))
 
         if not contexts:
-            return {"markets": 0, "predictions": 0, "alerts": 0}
+            return {"markets": 0, "predictions": 0, "high_ev_picks": 0, "alerts": 0, "elapsed_s": 0.0}
 
         # Batch predict
         ctx_list = [c for _, _, c in contexts]
         preds = self._predictor.batch_predict(ctx_list)
 
-        # Filter high-EV picks for parlay building
         scored_picks: list[ScoredPick] = []
         n_alerted = 0
+        n_saved = 0
 
         async with AsyncSessionLocal() as session:
             prediction_map: dict[str, Prediction] = {}
@@ -274,10 +232,12 @@ class MarketScanner:
             for (source, raw, ctx), pred in zip(contexts, preds):
                 try:
                     market = await self._persist_market(session, raw, ctx, source)
+                    await session.flush()
                     explanation = self._make_explanation(ctx, pred)
                     db_pred = await self._persist_prediction(session, market, pred, explanation)
+                    await session.flush()
+                    n_saved += 1
 
-                    # Collect for parlay builder
                     if pred["expected_value"] >= settings.min_ev_threshold:
                         pick_id = str(db_pred.id)
                         prediction_map[pick_id] = db_pred
@@ -298,7 +258,6 @@ class MarketScanner:
                             source=source,
                         ))
 
-                    # Send Discord alert for top individual picks
                     if (
                         pred["confidence"] >= settings.confidence_threshold
                         and pred["expected_value"] >= settings.min_ev_threshold
@@ -310,9 +269,12 @@ class MarketScanner:
 
                 except Exception as exc:
                     logger.error("persist_error", error=str(exc))
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
                     continue
 
-            # Build parlays from top picks
             if len(scored_picks) >= 2:
                 parlays = build_parlays(
                     scored_picks,
@@ -320,20 +282,22 @@ class MarketScanner:
                     min_ev=settings.min_ev_threshold,
                 )
                 for _n, top_combos in parlays.items():
-                    for combo in top_combos[:1]:  # best combo per leg count
+                    for combo in top_combos[:1]:
                         try:
                             await self._persist_parlay(session, combo, prediction_map)
-                            if self._discord_alert:
-                                await self._discord_alert.send_parlay_alert(combo)
                         except Exception as exc:
                             logger.error("parlay_persist_error", error=str(exc))
 
-            await session.commit()
+            try:
+                await session.commit()
+            except Exception as exc:
+                logger.error("commit_error", error=str(exc))
+                await session.rollback()
 
         elapsed = asyncio.get_event_loop().time() - t0
         summary = {
             "markets": len(contexts),
-            "predictions": len(preds),
+            "predictions": n_saved,
             "high_ev_picks": len(scored_picks),
             "alerts": n_alerted,
             "elapsed_s": round(elapsed, 1),
@@ -342,7 +306,6 @@ class MarketScanner:
         return summary
 
     async def run_forever(self) -> None:
-        """Loop: scan → sleep → scan → ..."""
         self._running = True
         logger.info("scanner_started", interval_s=settings.scan_interval_seconds)
         while self._running:
@@ -354,10 +317,3 @@ class MarketScanner:
 
     def stop(self) -> None:
         self._running = False
-
-
-def _decimal_to_american(dec: float) -> int:
-    if dec >= 2.0:
-        return int(round((dec - 1) * 100))
-    else:
-        return int(round(-100 / (dec - 1)))
